@@ -18,6 +18,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
+
 import flashinfer.fused_moe as fused_moe
 from flashinfer import (
     fp4_quantize,
@@ -27,6 +28,14 @@ from flashinfer import (
     mxfp8_quantize,
     mxfp4_dequantize_host,
 )
+
+import numpy as np
+from flashinfer import testing
+
+def benchmark_fn(fn, docstring: str):
+    measured_times = testing.bench_gpu_time_with_cuda_event(fn)
+    ms = np.average(measured_times)
+    print("\n \033[1;32m" + docstring + f" Benchmark Time: {ms:.3f} ms" + "\033[0m")
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -225,7 +234,6 @@ INTERMEDIATE_SIZES = [
 EP_NUM_EXPERTS = [8]
 EP_TOP_K = [2]
 
-
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
@@ -271,6 +279,23 @@ def test_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size):
     )
 
     torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
+
+    def fn():
+        flash_output = torch.empty_like(ref_output)
+        fused_moe.cutlass_fused_moe(
+            x,
+            selected_experts.to(torch.int),
+            routing_weights,
+            w31_weight,
+            w2_weight,
+            flash_output.dtype,
+            output=flash_output,
+            quant_scales=None,
+        )
+    docstring = f"test_moe(batch_size={batch_size}, hidden_size={hidden_size}, num_experts={num_experts}, top_k={top_k}, intermediate_size={intermediate_size})"
+    benchmark_fn(fn, docstring)
+
+
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
@@ -349,6 +374,21 @@ def test_moe_fp8(
         output=flash_output,
     )
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
+
+    def fn():
+        flash_output = torch.empty_like(ref_output)
+        fused_moe.cutlass_fused_moe(
+            x_quant,
+            selected_experts.to(torch.int),
+            routing_weights,
+            w31_weight,
+            w2_weight,
+            otype,
+            quant_scales=quant_scales,
+            output=flash_output,
+        )
+    docstring = f"test_moe_fp8(batch_size={batch_size}, hidden_size={hidden_size}, num_experts={num_experts}, top_k={top_k}, intermediate_size={intermediate_size}, otype={otype}, wtype={wtype})"
+    benchmark_fn(fn, docstring)
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
@@ -511,6 +551,22 @@ def test_moe_nvfp4(
     )
     torch.testing.assert_close(ref_output, flash_output, rtol=2e-1, atol=2e-1)
 
+    def fn():
+        flash_output = torch.zeros_like(x)
+        fused_moe.cutlass_fused_moe(
+            hidden_states,
+            selected_experts.to(torch.int),
+            routing_weights,
+            w1_q.contiguous().view(torch.long),
+            w2_q.contiguous().view(torch.long),
+            otype,
+            quant_scales=quant_scales,
+            input_sf=input_sf,
+            output=flash_output,
+        )
+    docstring = f"test_moe_nvfp4(batch_size={batch_size}, hidden_size={hidden_size}, num_experts={num_experts}, top_k={top_k}, intermediate_size={intermediate_size}, otype={otype}, wtype={wtype}, quantized_input={quantized_input})"
+    benchmark_fn(fn, docstring)
+
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
@@ -603,6 +659,36 @@ def test_moe_expert_parallel(
     for ep_rank in range(ep_size):
         flash_output += outputs[ep_rank]  # [batch_size, num_experts]
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
+
+    def fn():
+        outputs = []
+        flash_output = torch.zeros_like(ref_output)
+        for ep_rank in range(ep_size):
+            out_hidden_states_local = torch.zeros_like(x)
+            experts_per_rank = num_experts // ep_size
+            expert_start = ep_rank * experts_per_rank
+            expert_end = expert_start + experts_per_rank
+            w31_weight_local = w31_weight[expert_start:expert_end, :]
+            w2_weight_local = w2_weight[expert_start:expert_end, :]
+            
+            fused_moe.cutlass_fused_moe(
+                x.contiguous(),
+                selected_experts.to(torch.int),
+                routing_weights,
+                w31_weight_local.contiguous(),
+                w2_weight_local.contiguous(),
+                x.dtype,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                quant_scales=None,
+                output=out_hidden_states_local,
+            )
+            outputs.append(out_hidden_states_local)
+        
+        for ep_rank in range(ep_size):
+            flash_output += outputs[ep_rank]
+    docstring = f"test_moe_expert_parallel(batch_size={batch_size}, hidden_size={hidden_size}, num_experts={num_experts}, top_k={top_k}, intermediate_size={intermediate_size})"
+    benchmark_fn(fn, docstring)
 
 
 TP_SIZES = [2, 4]
@@ -712,6 +798,48 @@ def test_moe_tensor_parallel(
     # All-reduce to sum partial results from all GPUs
     flash_output = sum(outputs)
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-2, atol=1e-2)
+
+    def fn():
+        outputs = []
+        for tp_rank in range(tp_size):
+            out_hidden_states_local = torch.zeros_like(x)
+            
+            w3_weight, w1_weight = torch.chunk(w31_weight, 2, dim=1)
+            
+            w3_shard_size = intermediate_size // tp_size
+            w3_start = tp_rank * w3_shard_size
+            w3_end = w3_start + w3_shard_size
+            w3_weight_local = w3_weight[:, w3_start:w3_end, :]
+            
+            w1_shard_size = intermediate_size // tp_size
+            w1_start = tp_rank * w1_shard_size
+            w1_end = w1_start + w1_shard_size
+            w1_weight_local = w1_weight[:, w1_start:w1_end, :]
+            
+            w31_weight_local = torch.cat([w3_weight_local, w1_weight_local], dim=1)
+            
+            w2_shard_size = intermediate_size // tp_size
+            w2_start = tp_rank * w2_shard_size
+            w2_end = w2_start + w2_shard_size
+            w2_weight_local = w2_weight[:, :, w2_start:w2_end]
+            
+            fused_moe.cutlass_fused_moe(
+                x.contiguous(),
+                selected_experts.to(torch.int),
+                routing_weights,
+                w31_weight_local.contiguous(),
+                w2_weight_local.contiguous(),
+                x.dtype,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                quant_scales=None,
+                output=out_hidden_states_local,
+            )
+            outputs.append(out_hidden_states_local)
+        
+        flash_output = sum(outputs)
+    docstring = f"test_moe_tensor_parallel(batch_size={batch_size}, hidden_size={hidden_size}, num_experts={num_experts}, tp_size={tp_size}, intermediate_size={intermediate_size})"
+    benchmark_fn(fn, docstring)
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
@@ -832,6 +960,59 @@ def test_moe_tensor_expert_parallel(
     # All-reduce to sum partial results from all GPUs
     flash_output = sum(outputs)
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-2, atol=1e-2)
+
+    def fn():
+        ep_size = num_experts // 2
+        outputs = []
+        
+        for ep_rank in range(ep_size):
+            experts_per_rank = num_experts // ep_size
+            expert_start = ep_rank * experts_per_rank
+            expert_end = expert_start + experts_per_rank
+            
+            w31_weight_ep = w31_weight[expert_start:expert_end, :]
+            w2_weight_ep = w2_weight[expert_start:expert_end, :]
+            
+            for tp_rank in range(tp_size):
+                out_hidden_states_local = torch.zeros_like(x)
+                
+                w3_weight, w1_weight = torch.chunk(w31_weight_ep, 2, dim=1)
+                
+                w3_shard_size = intermediate_size // tp_size
+                w3_start = tp_rank * w3_shard_size
+                w3_end = w3_start + w3_shard_size
+                w3_weight_local = w3_weight[:, w3_start:w3_end, :]
+                
+                w1_shard_size = intermediate_size // tp_size
+                w1_start = tp_rank * w1_shard_size
+                w1_end = w1_start + w1_shard_size
+                w1_weight_local = w1_weight[:, w1_start:w1_end, :]
+                
+                w31_weight_local = torch.cat([w3_weight_local, w1_weight_local], dim=1)
+                
+                w2_shard_size = intermediate_size // tp_size
+                w2_start = tp_rank * w2_shard_size
+                w2_end = w2_start + w2_shard_size
+                w2_weight_local = w2_weight_ep[:, :, w2_start:w2_end]
+                
+                out_hidden_states_local = fused_moe.cutlass_fused_moe(
+                    x.contiguous(),
+                    selected_experts.to(torch.int),
+                    routing_weights,
+                    w31_weight_local.contiguous(),
+                    w2_weight_local.contiguous(),
+                    x.dtype,
+                    tp_size=tp_size,
+                    tp_rank=tp_rank,
+                    ep_size=ep_size,
+                    ep_rank=ep_rank,
+                    quant_scales=None,
+                )
+                outputs.append(out_hidden_states_local[0])
+        
+        flash_output = sum(outputs)
+    docstring = f"test_moe_tensor_expert_parallel(batch_size={batch_size}, hidden_size={hidden_size}, num_experts={num_experts}, top_k={top_k}, tp_size={tp_size}, intermediate_size={intermediate_size})"
+    benchmark_fn(fn, docstring)
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -1215,6 +1396,26 @@ def test_moe_mxfp8_mxfp4(
 
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
+    def fn():
+        flash_output = torch.zeros_like(x)
+        fused_moe.cutlass_fused_moe(
+            mxfp8_x,
+            selected_experts.to(torch.int),
+            routing_weights,
+            mxfp4_w1.contiguous().view(torch.long),
+            mxfp4_w2.contiguous().view(torch.long),
+            otype,
+            swiglu_alpha=alpha_t,
+            swiglu_limit=limit_t,
+            swiglu_beta=beta_t,
+            quant_scales=quant_scales,
+            input_sf=mxfp8_x_sf,
+            use_mxfp8_act_scaling=True,
+            output=flash_output,
+        )
+    docstring = f"test_moe_mxfp8_mxfp4(batch_size={batch_size}, hidden_size={hidden_size}, num_experts={num_experts}, top_k={top_k}, intermediate_size={intermediate_size}, otype={otype}, alpha={alpha}, beta={beta}, limit={limit})"
+    benchmark_fn(fn, docstring)
+
 
 def dequant_mxfp4_batches_host(
     mat_fp4: torch.Tensor,
@@ -1347,6 +1548,25 @@ def test_moe_bf16_mxfp4(
     )
 
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
+
+    def fn():
+        flash_output = torch.zeros_like(x)
+        fused_moe.cutlass_fused_moe(
+            x_pad,
+            selected_experts.to(torch.int),
+            routing_weights,
+            w1.contiguous().view(torch.uint8),
+            w2.contiguous().view(torch.uint8),
+            torch.bfloat16,
+            swiglu_alpha=alpha_t,
+            swiglu_limit=limit_t,
+            swiglu_beta=beta_t,
+            quant_scales=quant_scales,
+            use_w4_group_scaling=True,
+            output=flash_output,
+        )
+    docstring = f"test_moe_bf16_mxfp4(batch_size={batch_size}, hidden_size={hidden_size}, num_experts={num_experts}, top_k={top_k}, intermediate_size={intermediate_size}, alpha={alpha}, beta={beta}, limit={limit})"
+    benchmark_fn(fn, docstring)
 
 
 if __name__ == "__main__":
