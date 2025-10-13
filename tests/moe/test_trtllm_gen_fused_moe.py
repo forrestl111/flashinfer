@@ -49,12 +49,191 @@ from flashinfer.fused_moe.core import (
 from flashinfer.utils import calculate_tile_tokens_dim, get_compute_capability
 
 
+import gc, itertools
+import numpy as np
+from flashinfer import testing
+import pandas as pd
+
+def benchmark_fn(fn, docstring: str):
+    measured_times = testing.bench_gpu_time_with_cuda_event(fn, dry_run_iters=5, repeat_iters=10)
+    ms = np.average(measured_times)
+    print("\n \033[1;32m" + docstring + f" Benchmark Time: {ms:.3f} ms" + "\033[0m")
+    return ms
+
+
 def check_cuda(err):
     """Unified CUDA error checking function used throughout the file."""
     if err != runtime.cudaError_t.cudaSuccess:
         error_name = runtime.cudaGetErrorName(err)
         error_string = runtime.cudaGetErrorString(err)
         raise RuntimeError(f"CUDA error: {error_name[1]}: {error_string[1]}")
+
+
+
+def save_test_results_to_excel(test_results, filename, test_name=None, show_stats=True, verbose=True):
+    """
+    将测试结果保存到Excel文件的通用函数
+    
+    Parameters:
+    -----------
+    test_results : list
+        包含测试结果字典的列表，每个字典包含测试参数和结果
+    filename : str
+        Excel文件名，可以包含或不包含.xlsx扩展名
+    test_name : str, optional
+        测试名称，用于打印信息。如果为None，使用filename
+    show_stats : bool, optional
+        是否显示统计信息，默认True
+    verbose : bool, optional
+        是否显示详细进度信息，默认True
+        
+    Returns:
+    --------
+    dict
+        包含保存结果的统计信息
+    """
+    if not test_results:
+        if verbose:
+            print("没有测试结果需要保存")
+        return {"saved": False, "total_tests": 0, "successful_tests": 0, "failed_tests": 0}
+    
+    # 确保文件名有正确的扩展名
+    if not filename.endswith('.xlsx'):
+        filename += '.xlsx'
+    
+    # 使用文件名作为默认测试名称
+    if test_name is None:
+        test_name = filename.replace('.xlsx', '')
+    
+    try:
+        # 创建DataFrame
+        df = pd.DataFrame(test_results)
+        
+        # 使用ExcelWriter来实现更好的格式控制
+        with pd.ExcelWriter(filename, engine='xlsxwriter') as writer:
+            df.to_excel(writer, sheet_name='测试结果', index=False)
+            
+            # 获取工作表和工作簿对象
+            worksheet = writer.sheets['测试结果']
+            workbook = writer.book
+            
+            # 定义表头格式
+            header_format = workbook.add_format({
+                'bold': True,
+                'text_wrap': True,
+                'valign': 'top',
+                'fg_color': '#D7E4BC',
+                'border': 1
+            })
+            
+            # 定义数据格式
+            cell_format = workbook.add_format({
+                'text_wrap': True,
+                'valign': 'top',
+                'border': 1
+            })
+            
+            # 应用表头格式
+            for col_num, value in enumerate(df.columns.values):
+                worksheet.write(0, col_num, value, header_format)
+            
+            # 计算每列的最佳宽度
+            for i, col in enumerate(df.columns):
+                # 计算列名长度
+                column_len = len(str(col))
+                
+                # 计算该列数据的最大长度
+                if len(df) > 0:
+                    max_len = df[col].astype(str).str.len().max()
+                    column_len = max(column_len, max_len)
+                
+                # 设置合理的列宽范围（最小8，最大50）
+                column_len = min(max(column_len + 2, 8), 50)
+                worksheet.set_column(i, i, column_len, cell_format)
+            
+            # 如果数据量大，启用自动筛选
+            if len(df) > 1:
+                worksheet.autofilter(0, 0, len(df), len(df.columns) - 1)
+        
+        if verbose:
+            print(f"\n测试结果已保存到 {filename}")
+            print(f"总共完成 {len(test_results)} 个测试用例")
+        
+        # 统计信息
+        successful_tests = df[df['latency_ms'].notna()]
+        failed_tests_count = len(test_results) - len(successful_tests)
+        
+        stats = {
+            "saved": True,
+            "filename": filename,
+            "total_tests": len(test_results),
+            "successful_tests": len(successful_tests),
+            "failed_tests": failed_tests_count
+        }
+        
+        if show_stats and verbose:
+            if len(successful_tests) > 0:
+                print(f"成功测试: {len(successful_tests)} 个")
+                if 'latency_ms' in successful_tests.columns:
+                    stats["avg_latency"] = successful_tests['latency_ms'].mean()
+                    stats["min_latency"] = successful_tests['latency_ms'].min()  
+                    stats["max_latency"] = successful_tests['latency_ms'].max()
+                    print(f"平均延迟: {stats['avg_latency']:.3f} ms")
+                    print(f"延迟范围: {stats['min_latency']:.3f} - {stats['max_latency']:.3f} ms")
+            
+            if failed_tests_count > 0:
+                print(f"失败测试: {failed_tests_count} 个")
+        
+        return stats
+        
+    except Exception as e:
+        error_msg = f"保存Excel文件时出错: {str(e)}"
+        if verbose:
+            print(error_msg)
+        return {
+            "saved": False, 
+            "error": error_msg,
+            "total_tests": len(test_results),
+            "successful_tests": 0,
+            "failed_tests": len(test_results)
+        }
+
+
+def collect_test_result(test_params, latency=None, error=None, extra_data=None):
+    """
+    收集单个测试结果的辅助函数
+    
+    Parameters:
+    -----------
+    test_params : dict
+        测试参数字典
+    latency : float, optional
+        测试延迟结果（毫秒）
+    error : str, optional
+        错误信息（如果测试失败）
+    extra_data : dict, optional
+        额外需要记录的数据
+        
+    Returns:
+    --------
+    dict
+        格式化的测试结果字典
+    """
+    result = test_params.copy()
+    
+    if latency is not None:
+        result['latency_ms'] = latency
+    else:
+        result['latency_ms'] = None
+        
+    if error is not None:
+        result['error'] = error
+        
+    if extra_data:
+        result.update(extra_data)
+        
+    return result
+
 
 
 class CUDAGraphMoE:
@@ -316,6 +495,7 @@ class FP4Moe(Moe):
             or quant_mode == QuantMode.FP4_MXFP4_Bf16
         )
         self.sf_vec_size = 32 if self.is_mxfp4 else 16
+        self.cuda_graph = None
 
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """Quantize weights to FP4 format and compute global scale factors."""
@@ -572,13 +752,14 @@ class FP4Moe(Moe):
         }
 
         # Create, capture and launch CUDA graph in one shot
-        cuda_graph = CUDAGraphMoE(self, static_data, **config)
-        try:
-            cuda_graph.capture(hidden_states_orig, **runtime_args)
-            output = cuda_graph.launch(hidden_states_orig)
-            return output[0].to(torch.float)
-        finally:
-            cuda_graph.cleanup()
+        if self.cuda_graph is None:
+            print("Creating CUDA graph")
+            self.cuda_graph = CUDAGraphMoE(self, static_data, **config)
+        if not self.cuda_graph.is_captured:
+            print("Capturing CUDA graph")
+            self.cuda_graph.capture(hidden_states_orig, **runtime_args)
+        output = self.cuda_graph.launch(hidden_states_orig)
+        return output[0].to(torch.float)
 
     def compute_reference(self, args):
         return run_moe_reference_fp4(args, self.quant_mode)
@@ -1792,6 +1973,9 @@ def run_moe_reference_per_tensor_scale_fp8(args):
 def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
     """Unified actual computation that delegates to implementation-specific methods."""
     # 1. Prepare static weights for the kernel (offline processing)
+    start_time = torch.cuda.Event(enable_timing=True)
+    end_time = torch.cuda.Event(enable_timing=True)
+    start_time.record()
     static_data = moe_impl.prepare_static_weights_for_kernel(
         args_dequant,
         args,
@@ -1802,7 +1986,9 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
         args.num_experts,
         kwargs["weight_processing"],
     )
-
+    end_time.record()
+    torch.cuda.synchronize()
+    print(f"Prepare static weights for kernel time: {start_time.elapsed_time(end_time)} ms")
     # 2. Call MoE with runtime input quantization + kernel execution
     kernel_kwargs = {
         "expert_logits": kwargs["expert_logits"],
@@ -2236,33 +2422,153 @@ def test_moe_quantization_classes(
     )
 
 
+    # benchmark the MoE computation
+    kwargs = {
+        "expert_logits": expert_logits,
+        "routing_bias": routing_bias,
+        "hidden_states_orig": hidden_states,
+        "gemm1_weights_orig": gemm1_weights,
+        "gemm2_weights_orig": gemm2_weights,
+        "n_groups": n_groups,
+        "top_k_groups": top_k_groups,
+        "routed_scaling": routed_scaling,
+        "routing_method_type": routing_method_type,
+        "tile_tokens_dim": tile_tokens_dim,
+        "weight_processing": weight_processing,
+        "enable_pdl": True,
+        "hidden_states_quant": inputs_data[
+            "hidden_states"
+        ],  # NOTE(yingyi): only for fp8 block scale for now, refactor later
+    }
+
+    # 1. Prepare static weights for the kernel (offline processing)
+    start_time = torch.cuda.Event(enable_timing=True)
+    end_time = torch.cuda.Event(enable_timing=True)
+    start_time.record()
+    static_data = moe_impl.prepare_static_weights_for_kernel(
+        args_dequant,
+        args,
+        kwargs["gemm1_weights_orig"],
+        kwargs["gemm2_weights_orig"],
+        args.hidden_size,
+        args.intermediate_size,
+        args.num_experts,
+        kwargs["weight_processing"],
+    )
+    end_time.record()
+    torch.cuda.synchronize()
+    print(f"Prepare static weights for kernel time: {start_time.elapsed_time(end_time)} ms")
+    # 2. Call MoE with runtime input quantization + kernel execution
+    kernel_kwargs = {
+        "expert_logits": kwargs["expert_logits"],
+        "routing_bias": kwargs["routing_bias"],
+        "num_experts": args.num_experts,
+        "num_tokens": args.num_tokens,
+        "hidden_size": args.hidden_size,
+        "top_k": args.top_k,
+        "n_groups": kwargs["n_groups"],
+        "top_k_groups": kwargs["top_k_groups"],
+        "intermediate_size": args.intermediate_size,
+        "routed_scaling": kwargs["routed_scaling"],
+        "routing_method_type": kwargs["routing_method_type"],
+        "tile_tokens_dim": kwargs["tile_tokens_dim"],
+        "do_finalize": True,
+        "gated_act_type": args.gated_act_type,
+        "hidden_states_scale": args.hidden_states_scale,
+        "hidden_states_quant": kwargs["hidden_states_quant"],
+    }
+
+    def fn():
+        moe_impl.call_moe(
+            static_data,
+            kwargs["hidden_states_orig"],
+            args.hidden_states_scale_global,
+            **kernel_kwargs,
+        )
+    
+    latency = benchmark_fn(fn, f"test_moe_quantization_classes(num_tokens={num_tokens}, hidden_size={hidden_size}, intermediate_size={intermediate_size}, moe_impl={moe_impl.name})")
+    return latency
+
+
+def benchmark_trtllm_gen_fused_moe(num_experts=256, top_k=8, n_groups=8, top_k_groups=4, hidden_size=1024, intermediate_size=1024):
+    num_tokens_list = [1024, 4*1024, 16*1024, 64*1024, 256*1024]
+    moe_impls = [FP4Moe, FP8BlockScaleMoe]
+    
+    # 创建数据收集列表
+    test_results = []
+
+    for moe_impl, num_tokens in itertools.product(moe_impls, num_tokens_list):
+        routing_config = {
+            "num_experts": num_experts,
+            "top_k": top_k,
+            "padding": 8,
+            "n_groups": n_groups,
+            "top_k_groups": top_k_groups,
+            "routed_scaling": 2.5,
+            "has_routing_bias": True,
+            "routing_method_type": RoutingMethodType.DeepSeekV3,
+            "compatible_moe_impls": [
+                moe_impl,
+            ],
+        }
+        weight_processing = {
+            "use_shuffled_weight": False,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [moe_impl],
+        }
+        test_params = {
+            "moe_impl": moe_impl.__name__,
+            "num_tokens": num_tokens,
+            "num_experts": num_experts,
+            "top_k": top_k,
+            "n_groups": n_groups,
+            "top_k_groups": top_k_groups,
+            "hidden_size": hidden_size,
+            "intermediate_size": intermediate_size,
+        }
+        try:
+            has_cuda_graph = False
+            if moe_impl.__name__ == "FP4Moe":
+                moe = moe_impl(quant_mode=QuantMode.FP4_NVFP4_NVFP4)
+                has_cuda_graph = True
+            else:
+                moe = moe_impl()
+            _cache_permute_indices= {}
+            latency = test_moe_quantization_classes(
+                            num_tokens=num_tokens,
+                            hidden_size=hidden_size,
+                            intermediate_size=intermediate_size,
+                            moe_impl=moe,
+                            routing_config=routing_config,
+                            weight_processing=weight_processing,
+                            gated_act_type=GatedActType.SwiGlu,
+                            cache_permute_indices=_cache_permute_indices,
+                        )
+            if has_cuda_graph:
+                moe.cuda_graph.cleanup()
+            # 使用辅助函数收集成功的测试结果
+            result_data = collect_test_result(test_params, latency=latency)
+            test_results.append(result_data)
+            
+            print(f"测试完成 - moe_impl: {moe_impl.__name__}, num_tokens: {num_tokens}, latency: {latency:.3f} ms")
+            
+        except Exception as e:
+            error_msg = str(e)
+            print(f"测试失败 - moe_impl: {moe_impl.__name__}, num_tokens: {num_tokens}, error: {error_msg}")
+            
+            # 使用辅助函数收集失败的测试结果
+            result_data = collect_test_result(test_params, error=error_msg)
+            test_results.append(result_data)
+        
+        finally:
+            gc.collect()
+            torch.cuda.empty_cache()
+    
+    
+    # 使用通用函数保存结果到Excel文件
+    save_test_results_to_excel(test_results, "test_trtllm_gen_fused_moe", show_stats=True)
+
+
 if __name__ == "__main__":
     # pytest.main([__file__, "-v"])
-    routing_config = {
-        "num_experts": 256,
-        "top_k": 8,
-        "padding": 8,
-        "n_groups": 8,
-        "top_k_groups": 4,
-        "routed_scaling": 2.5,
-        "has_routing_bias": True,
-        "routing_method_type": RoutingMethodType.DeepSeekV3,
-        "compatible_moe_impls": [
-            FP8BlockScaleMoe,
-        ],
-    }
-    weight_processing = {
-        "use_shuffled_weight": False,
-        "layout": WeightLayout.MajorK,
-        "compatible_moe_impls": [FP8BlockScaleMoe],
-    }
-    test_moe_quantization_classes(
-        num_tokens=4,
-        hidden_size=1024,
-        intermediate_size=1024,
-        moe_impl=FP8BlockScaleMoe(),
-        routing_config=routing_config,
-        weight_processing=weight_processing,
-        gated_act_type=GatedActType.SwiGlu,
-        cache_permute_indices=cache_permute_indices,
-    )
+    benchmark_trtllm_gen_fused_moe()
