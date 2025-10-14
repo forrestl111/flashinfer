@@ -1435,7 +1435,8 @@ def benchmark_trtllm_batch_decode_with_kv_cache():
             test_results.append(result_data)
             
             print(f"测试完成 - batch_size: {bs}, kv_len: {kv_len}, latency: {latency:.3f} ms")
-            
+            gc.collect()
+            torch.cuda.empty_cache()
         except Exception as e:
             error_msg = str(e)
             print(f"测试失败 - batch_size: {bs}, kv_len: {kv_len}, error: {error_msg}")
@@ -1443,10 +1444,7 @@ def benchmark_trtllm_batch_decode_with_kv_cache():
             # 使用辅助函数收集失败的测试结果
             result_data = collect_test_result(test_params, error=error_msg)
             test_results.append(result_data)
-        
-        finally:
-            gc.collect()
-            torch.cuda.empty_cache()
+
     
     # 使用通用函数保存结果到Excel文件
     save_test_results_to_excel(test_results, "test_trtllm_batch_decode", show_stats=True)
@@ -1454,5 +1452,5 @@ def benchmark_trtllm_batch_decode_with_kv_cache():
 
 if __name__ == "__main__":
     benchmark_trtllm_batch_context_with_kv_cache()
-    # benchmark_trtllm_batch_decode_with_kv_cache()
+    benchmark_trtllm_batch_decode_with_kv_cache()
     
