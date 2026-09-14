@@ -7,6 +7,7 @@
 # omitted -- FlashInfer's blk64 integration is JIT-only, matching the existing
 # blk128 CuTe-DSL integration (see bsa_attn_sm100_blk128.py).
 
+import os
 import warnings
 from functools import lru_cache
 from typing import Optional, Tuple
@@ -862,11 +863,12 @@ def validate_sm100_blk64_fp8_sage(
         raise ValueError(
             "Sage FP8 blk64 requires batch_size == 1 (upstream kernel limit)"
         )
-    if num_head not in (4, 8):
-        raise ValueError(
-            f"Sage FP8 blk64 requires num_head in (4, 8), got {num_head} "
-            "(upstream kernel limit)"
-        )
+    # The (4, 8) restriction is not a kernel limit. Nothing in the Sage path of
+    # bsa_fwd_sm100.py depends on the head count, and h = 7 / 14 / 16 / 56 all land
+    # within fp8 quantisation noise of a dense bf16 reference (max diff
+    # 0.0068-0.0082, against 0.0068 for the nominally-supported h=8).
+    if num_head <= 0:
+        raise ValueError(f"Sage FP8 blk64 requires num_head > 0, got {num_head}")
     if q2k_block_nums is not None and q2k_block_nums.numel() > 0:
         raise ValueError(
             "Sage FP8 blk64 requires a uniform top-k (q2k_block_nums must be "
@@ -877,10 +879,23 @@ def validate_sm100_blk64_fp8_sage(
             "Sage FP8 blk64 requires full 64-token KV blocks (block_sizes must "
             "be None); partial/padded KV blocks are not supported yet"
         )
-    if seqlen_k % 64 != 0:
+    # A partial tail is safe as long as the routing plan never selects the
+    # incomplete KV block -- the kernel then simply never loads it. What does not
+    # work is letting it be selected: block_sizes' -inf mask is applied to the raw
+    # scores, before Sage's group-max/rescale, so a fully masked group becomes
+    # -inf * scale and comes out NaN. The bf16 partial-tail fix (PR #5090) is also
+    # unusable here: its use_exact_kv_layout rank-5 view corrupts Sage's D-major KV
+    # indexing even when the tail block is never selected (measured: max diff 0.47
+    # vs 0.0074 with the packed rank-6 view). Callers that cannot guarantee the
+    # exclusion should round seqlen_k down to a multiple of 64 instead.
+    if (
+        seqlen_k % 64 != 0
+        and os.environ.get("FLASHINFER_SAGE_ALLOW_PARTIAL_TAIL") != "1"
+    ):
         raise ValueError(
             f"Sage FP8 blk64 requires seqlen_k divisible by 64 (got {seqlen_k}); "
-            "the D-major KV layout does not support partial 64-token tail blocks"
+            "set FLASHINFER_SAGE_ALLOW_PARTIAL_TAIL=1 if the routing plan never "
+            "selects the incomplete tail block"
         )
     if (
         q_scale.dtype != torch.float32
