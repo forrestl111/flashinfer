@@ -74,35 +74,34 @@ std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
     TORCH_CHECK(q2k_block_index.size(3) == block_sparse_num, "q2k_block_index kv_blocks mismatch");
   }
 
-  // ======== Prepare Q ========
-  auto q_bhsd = q.permute({0, 2, 1, 3}).contiguous();
-  auto q_padded = torch::zeros({batch, heads, rows_padded, kQkK}, q.options());
-  q_padded.narrow(2, 0, seq_q).copy_(q_bhsd);
-  auto q_tiled = q_padded.view({batch * heads * num_row_tiles, kRows, kQkK}).contiguous();
+  // ======== Q: no staging ========
+  // The Q TMA addresses the packed post-a2a buffer directly, so the BHSD repack and its
+  // rows_padded zero-fill are both gone -- TMA bounds-checking covers the tile tail.
+  TORCH_CHECK(q.stride(3) == 1, "Q head_dim must be contiguous");
+  TORCH_CHECK((q.stride(1) % 8) == 0 && (q.stride(2) % 8) == 0,
+              "Q token/head strides must be 16B aligned for TMA");
+  int const q_row_stride = static_cast<int>(q.stride(1));
+  int const q_head_stride = static_cast<int>(q.stride(2));
 
-  // ======== Prepare K ========
-  auto k_bhsd = k.permute({0, 2, 1, 3}).contiguous();
+  // ======== K / V: no staging ========
+  // Both TMAs address the packed post-a2a buffer directly. k/v are last-dim slices of
+  // one [S, h_local, 3*head_dim] tensor, so a (token, dim_in_half, dim_half, head)
+  // descriptor reaches every block by box coordinate -- no relayout, no padding.
   int const total_k_padded = ((seq_k + kSparseBlockSize - 1) / kSparseBlockSize) * kSparseBlockSize;
   int const total_sparse_blocks = total_k_padded / kSparseBlockSize;
-  auto k_padded = torch::zeros({batch, heads, total_k_padded, kQkK}, k.options());
-  k_padded.narrow(2, 0, seq_k).copy_(k_bhsd);
-  auto k_blocks =
-      k_padded.view({batch, heads, total_sparse_blocks, kSparseBlockSize, 2, kDimHalf})
-          .permute({0, 1, 2, 4, 3, 5})
-          .reshape({batch * heads * total_sparse_blocks * 2, kSparseBlockSize, kDimHalf})
-          .contiguous();
+  TORCH_CHECK(k.stride(3) == 1 && v.stride(3) == 1, "K/V head_dim must be contiguous");
+  TORCH_CHECK(k.stride(1) == v.stride(1) && k.stride(2) == v.stride(2),
+              "K and V must share the packed-buffer geometry");
+  // TMA requires 16B-aligned strides; bf16 makes that 8 elements.
+  TORCH_CHECK((k.stride(1) % 8) == 0 && (k.stride(2) % 8) == 0,
+              "K/V token/head strides must be 16B aligned for TMA");
+  int const kv_row_stride = static_cast<int>(k.stride(1));
+  int const kv_head_stride = static_cast<int>(k.stride(2));
 
-  // ======== Prepare V ========
-  auto v_bhds = v.permute({0, 2, 3, 1}).contiguous();
-  auto v_padded = torch::zeros({batch, heads, kOutputCols, total_k_padded}, v.options());
-  v_padded.narrow(3, 0, seq_k).copy_(v_bhds);
-  auto v_blocks =
-      v_padded.view({batch, heads, 2, kDimHalf, total_sparse_blocks, kSparseBlockSize})
-          .permute({0, 1, 4, 2, 3, 5})
-          .reshape({batch * heads * total_sparse_blocks * 2, kDimHalf, kSparseBlockSize})
-          .contiguous();
-
-  auto out_flat = torch::zeros({batch * heads * num_row_tiles, kRows, kOutputCols}, q.options());
+  auto out_flat = torch::empty({batch * heads * num_row_tiles, kRows, kOutputCols}, q.options());
+  if constexpr (HasVarBlockNums) {
+    out_flat.zero_();  // a row with zero key blocks is never written by the epilogue
+  }
   auto lse_flat =
       torch::full({batch * heads * num_row_tiles * kRows}, -std::numeric_limits<float>::infinity(),
                   torch::dtype(torch::kFloat32).device(q.device()));
@@ -124,15 +123,21 @@ std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
   typename Kernel::Arguments args{
       // mainloop
       {
-          reinterpret_cast<bf16 const*>(q_tiled.data_ptr<at::BFloat16>()),
-          reinterpret_cast<bf16 const*>(k_blocks.data_ptr<at::BFloat16>()),
-          reinterpret_cast<bf16 const*>(v_blocks.data_ptr<at::BFloat16>()),
+          reinterpret_cast<bf16 const*>(q.data_ptr<at::BFloat16>()),
+          reinterpret_cast<bf16 const*>(k.data_ptr<at::BFloat16>()),
+          reinterpret_cast<bf16 const*>(v.data_ptr<at::BFloat16>()),
           softmax_scale,
           bi_flat.data_ptr<int>(),
           block_indices_stride,
           block_sizes.defined() && block_sizes.numel() > 0 ? block_sizes.data_ptr<int>() : nullptr,
           ptr_q2k_block_nums,
           raw_block_sparse_num,
+          kv_row_stride,
+          kv_head_stride,
+          seq_k,
+          q_row_stride,
+          q_head_stride,
+          seq_q,
       },
       // epilogue
       {reinterpret_cast<bf16*>(out_flat.data_ptr<at::BFloat16>()), lse_flat.data_ptr<float>()},
